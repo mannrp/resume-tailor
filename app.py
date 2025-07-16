@@ -1,18 +1,11 @@
 import streamlit as st
 import google.generativeai as genai
-import tempfile
-import subprocess
-import os
-import re
-import requests
-import base64
-import platform
-import PyPDF2
-import pdfplumber
-import io
 from dataclasses import dataclass, field
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Any
 import json
+import re
+import io
+import requests
 
 # Add docx support
 try:
@@ -23,6 +16,15 @@ try:
 except ImportError:
     DOCX_AVAILABLE = False
     st.warning("python-docx not installed. DOCX export will not be available.")
+
+# Add PDF processing support
+try:
+    import pdfplumber
+    import PyPDF2
+    PDF_AVAILABLE = True
+except ImportError:
+    PDF_AVAILABLE = False
+    st.warning("PDF processing libraries not installed. ATS analysis will be limited.")
 
 # Page configuration
 st.set_page_config(page_title="Resume Tailor", layout="wide")
@@ -53,21 +55,18 @@ def escape_latex_characters(text):
     if not text:
         return text
     
-    # First, check and remove any accidental LaTeX commands that might have been introduced
-    # This prevents "Forbidden control sequence" errors
-    text = re.sub(r'\\(?!(textbf|textit|underline|&|\$|%|#|_|\{|\}|textasciicircum|textasciitilde))[a-zA-Z]+', '', text)
+    text = re.sub(r'\\(?!(textbf|textit|underline|&|\$|%|#|_|\{|\}|textasciicircum|textasciitilde|hfill))[a-zA-Z]+', '', text)
     
-    # Only escape the most problematic characters for resume content
     latex_chars = {
-        '&': '\\&',        # Most common issue in job titles
-        '%': '\\%',        # Percentages in achievements
-        '$': '\\$',        # Dollar signs in salary/achievements
-        '#': '\\#',        # Hash symbols
-        '_': '\\_',        # Underscores in email/URLs
-        '{': '\\{',        # Braces
-        '}': '\\}',        # Braces
-        '^': '\\textasciicircum{}',  # Carets
-        '~': '\\textasciitilde{}',   # Tildes
+        '&': '\\&',
+        '%': '\\%',
+        '$': '\\$',
+        '#': '\\#',
+        '_': '\\_',
+        '{': '\\{',
+        '}': '\\}',
+        '^': '\\textasciicircum{}',
+        '~': '\\textasciitilde{}',
     }
     
     for char, escaped in latex_chars.items():
@@ -78,17 +77,11 @@ def escape_latex_characters(text):
 def to_json_serializable(obj):
     """Convert dataclass objects to JSON-serializable dictionaries"""
     if hasattr(obj, '__dict__'):
-        result = {}
-        for key, value in obj.__dict__.items():
-            if hasattr(value, '__dict__'):
-                result[key] = to_json_serializable(value)
-            elif isinstance(value, dict):
-                result[key] = {k: to_json_serializable(v) for k, v in value.items()}
-            elif isinstance(value, list):
-                result[key] = [to_json_serializable(item) for item in value]
-            else:
-                result[key] = value
-        return result
+        return {key: to_json_serializable(value) for key, value in obj.__dict__.items()}
+    elif isinstance(obj, list):
+        return [to_json_serializable(item) for item in obj]
+    elif isinstance(obj, dict):
+        return {key: to_json_serializable(value) for key, value in obj.items()}
     else:
         return obj
 
@@ -96,17 +89,434 @@ def to_json_serializable(obj):
 class ResumeSection:
     title: str
     lines: List[str] = field(default_factory=list)
-    subsections: Dict[str, List[str]] = field(default_factory=dict)
+    # Using a flexible list of dictionaries for subsections to handle varied formats
+    subsections: List[Dict[str, Any]] = field(default_factory=list)
 
 @dataclass
 class StructuredResume:
-    contact: ResumeSection
+    contact: Optional[ResumeSection] = None
     summary: Optional[ResumeSection] = None
-    experience: ResumeSection = None
-    skills: ResumeSection = None
-    education: ResumeSection = None
+    experience: Optional[ResumeSection] = None
+    skills: Optional[ResumeSection] = None
+    education: Optional[ResumeSection] = None
     projects: Optional[ResumeSection] = None
     certifications: Optional[ResumeSection] = None
+
+# ... (Keep your API key and sidebar configuration code as is) ...
+
+def parse_latex_into_structure(latex_code: str) -> StructuredResume:
+    """Parse LaTeX resume into a structured format with separated dates."""
+    
+    prompt = f"""
+Parse this LaTeX resume into a structured JSON format. It is critical to separate headings (like job titles or degrees) from their corresponding dates and locations.
+
+LaTeX Resume:
+{latex_code}
+
+Return a JSON object with this exact structure. For sections with multiple entries (like Experience or Education), use the "subsections" list. Each item in the list should be an object with distinct fields for heading, organization, location, date, and bullet points.
+
+IMPORTANT: Look for these LaTeX patterns to extract data correctly:
+- \\resumeSubheading{{title}}{{date}}{{organization}}{{location}}
+- \\resumeProjectHeading{{title}}{{date}}
+- \\textbf{{title | organization | date}} (older format - split these)
+
+{{
+    "contact": {{
+        "title": "Contact Information",
+        "lines": ["Name", "Email | Phone", "Location | LinkedIn"]
+    }},
+    "summary": {{
+        "title": "Professional Summary",
+        "lines": ["Summary line 1", "Summary line 2"]
+    }},
+    "education": {{
+        "title": "Education",
+        "subsections": [
+            {{
+                "heading": "Business Administration Diploma – Finance",
+                "organization": "Northern Alberta Institute of Technology",
+                "location": "Edmonton, AB",
+                "date": "Jan. 2023 -- Apr. 2025",
+                "bullets": []
+            }}
+        ]
+    }},
+    "experience": {{
+        "title": "Experience",
+        "subsections": [
+            {{
+                "heading": "Multi Store Supervisor & Sales Associate",
+                "organization": "Mobile Planet",
+                "location": "Edmonton, AB",
+                "date": "May 2023 -- Present",
+                "bullets": ["Bullet point 1", "Bullet point 2"]
+            }}
+        ]
+    }},
+    "projects": {{
+        "title": "Projects",
+        "subsections": [
+            {{
+                "heading": "Real World Credit-Analysis & Lending Simulation",
+                "organization": "",
+                "location": "",
+                "date": "Sep. 2024 -- Dec. 2024",
+                "bullets": ["Bullet point 1", "Bullet point 2"]
+            }}
+        ]
+    }},
+    "certifications": {{
+        "title": "Certifications & Achievements",
+        "subsections": [
+            {{
+                "heading": "Canadian Securities Course (CSC) -- Completed",
+                "organization": "",
+                "location": "",
+                "date": "Apr. 2025",
+                "bullets": ["Bullet point 1"]
+            }}
+        ]
+    }},
+    "skills": {{
+        "title": "Skills",
+        "lines": ["Languages: Python, Java", "Frameworks: React, Django"]
+    }}
+}}
+
+CRITICAL RULES:
+- If a section is missing in the LaTeX, omit its key from the JSON.
+- For all sections with subsections (Education, Experience, Projects, Certifications), ALWAYS separate the date into the "date" field. DO NOT merge it with the "heading" or "organization".
+- When you see patterns like "Job Title | Company | Date", split them into separate fields.
+- Extract ONLY the text content, removing all LaTeX formatting commands.
+- Return only valid JSON, with no explanatory text before or after.
+"""
+    
+    try:
+        model = genai.GenerativeModel(selected_model)
+        response = model.generate_content(prompt)
+        
+        json_text = response.text.strip().replace('```json', '').replace('```', '')
+        data = json.loads(json_text)
+        
+        # Create resume object from parsed data
+        resume_data = {}
+        for section_name, section_data in data.items():
+            resume_data[section_name] = ResumeSection(
+                title=section_data.get("title", section_name.capitalize()),
+                lines=section_data.get("lines", []),
+                subsections=section_data.get("subsections", [])
+            )
+            
+        return StructuredResume(**resume_data)
+        
+    except Exception as e:
+        st.error(f"Error parsing LaTeX into new structure: {str(e)}")
+        st.error(f"LLM Response was: {response.text}")
+        return None
+
+def structure_to_latex(structured_resume: StructuredResume, original_latex: str = None) -> str:
+    """
+    Convert structured resume back to LaTeX format using proper resume template commands.
+    """
+    if original_latex:
+        # Try to preserve the original template structure
+        return preserve_original_latex_structure(structured_resume, original_latex)
+
+    # Fallback to standard resume template
+    latex_lines = [
+        "\\documentclass[letterpaper,11pt]{article}",
+        "",
+        "\\usepackage{latexsym}",
+        "\\usepackage[empty]{fullpage}",
+        "\\usepackage{titlesec}",
+        "\\usepackage{marvosym}",
+        "\\usepackage[usenames,dvipsnames]{color}",
+        "\\usepackage{verbatim}",
+        "\\usepackage{enumitem}",
+        "\\usepackage[hidelinks]{hyperref}",
+        "\\usepackage{fancyhdr}",
+        "\\usepackage[english]{babel}",
+        "\\usepackage{tabularx}",
+        "\\input{glyphtounicode}",
+        "",
+        "\\pagestyle{fancy}",
+        "\\fancyhf{}",
+        "\\fancyfoot{}",
+        "\\renewcommand{\\headrulewidth}{0pt}",
+        "\\renewcommand{\\footrulewidth}{0pt}",
+        "",
+        "\\addtolength{\\oddsidemargin}{-0.5in}",
+        "\\addtolength{\\evensidemargin}{-0.5in}",
+        "\\addtolength{\\textwidth}{1in}",
+        "\\addtolength{\\topmargin}{-0.5in}",
+        "\\addtolength{\\textheight}{1.0in}",
+        "",
+        "\\urlstyle{same}",
+        "",
+        "\\raggedbottom",
+        "\\raggedright",
+        "\\setlength{\\tabcolsep}{0in}",
+        "",
+        "\\titleformat{\\section}{",
+        "  \\vspace{-3pt}\\scshape\\raggedright\\large",
+        "}{}{0em}{}[\\color{black}\\titlerule \\vspace{-4pt}]",
+        "",
+        "\\pdfgentounicode=1",
+        "",
+        "\\newcommand{\\resumeItem}[1]{",
+        "  \\item\\small{",
+        "    {#1 \\vspace{-1pt}}",
+        "  }",
+        "}",
+        "",
+        "\\newcommand{\\resumeSubheading}[4]{",
+        "  \\vspace{-1pt}\\item",
+        "    \\begin{tabular*}{0.97\\textwidth}[t]{l@{\\extracolsep{\\fill}}r}",
+        "      \\textbf{#1} & #2 \\\\",
+        "      \\textit{\\small#3} & \\textit{\\small #4} \\\\",
+        "    \\end{tabular*}\\vspace{-6pt}",
+        "}",
+        "",
+        "\\newcommand{\\resumeProjectHeading}[2]{",
+        "    \\item",
+        "    \\begin{tabular*}{0.97\\textwidth}{l@{\\extracolsep{\\fill}}r}",
+        "      \\small#1 & #2 \\\\",
+        "    \\end{tabular*}\\vspace{-6pt}",
+        "}",
+        "",
+        "\\newcommand{\\resumeSubHeadingListStart}{\\begin{itemize}[leftmargin=0.15in, label={}]}",
+        "\\newcommand{\\resumeSubHeadingListEnd}{\\end{itemize}}",
+        "\\newcommand{\\resumeItemListStart}{\\begin{itemize}}",
+        "\\newcommand{\\resumeItemListEnd}{\\end{itemize}\\vspace{-3pt}}",
+        "",
+        "\\begin{document}",
+        ""
+    ]
+
+    # Contact section
+    if structured_resume.contact and structured_resume.contact.lines:
+        latex_lines.append("\\begin{center}")
+        for i, line in enumerate(structured_resume.contact.lines):
+            escaped_line = escape_latex_characters(line)
+            if i == 0:
+                latex_lines.append(f"    \\textbf{{\\Huge \\scshape {escaped_line}}} \\\\ \\vspace{{1pt}}")
+            else:
+                latex_lines.append(f"    \\small {escaped_line}")
+        latex_lines.append("\\end{center}")
+        latex_lines.append("")
+
+    # Summary section  
+    if structured_resume.summary and structured_resume.summary.lines:
+        latex_lines.append("\\section{Professional Summary}")
+        for line in structured_resume.summary.lines:
+            escaped_line = escape_latex_characters(line)
+            latex_lines.append(f"\\small{{{escaped_line}}}")
+        latex_lines.append("")
+
+    # Education section
+    if structured_resume.education and structured_resume.education.subsections:
+        latex_lines.append("\\section{Education}")
+        latex_lines.append("  \\resumeSubHeadingListStart")
+        for item in structured_resume.education.subsections:
+            heading = escape_latex_characters(item.get("heading", ""))
+            organization = escape_latex_characters(item.get("organization", ""))
+            location = escape_latex_characters(item.get("location", ""))
+            date = escape_latex_characters(item.get("date", ""))
+            
+            latex_lines.append(f"    \\resumeSubheading")
+            latex_lines.append(f"      {{{organization}}}{{{location}}}")
+            latex_lines.append(f"      {{{heading}}}{{{date}}}")
+            
+            bullets = item.get("bullets", [])
+            non_empty_bullets = [b for b in bullets if b.strip()]
+            if non_empty_bullets:
+                latex_lines.append("  \\resumeItemListStart")
+                for bullet in non_empty_bullets:
+                    latex_lines.append(f"  \\resumeItem{{{escape_latex_characters(bullet)}}}")
+                latex_lines.append("  \\resumeItemListEnd")
+        latex_lines.append("  \\resumeSubHeadingListEnd")
+        latex_lines.append("")
+
+    # Experience section
+    if structured_resume.experience and structured_resume.experience.subsections:
+        latex_lines.append("\\section{Experience}")
+        latex_lines.append("  \\resumeSubHeadingListStart")
+        for item in structured_resume.experience.subsections:
+            heading = escape_latex_characters(item.get("heading", ""))
+            organization = escape_latex_characters(item.get("organization", ""))
+            location = escape_latex_characters(item.get("location", ""))
+            date = escape_latex_characters(item.get("date", ""))
+            
+            latex_lines.append(f"    \\resumeSubheading")
+            latex_lines.append(f"      {{{heading}}}{{{date}}}")
+            latex_lines.append(f"      {{{organization}}}{{{location}}}")
+            
+            bullets = item.get("bullets", [])
+            non_empty_bullets = [b for b in bullets if b.strip()]
+            if non_empty_bullets:
+                latex_lines.append("  \\resumeItemListStart")
+                for bullet in non_empty_bullets:
+                    latex_lines.append(f"  \\resumeItem{{{escape_latex_characters(bullet)}}}")
+                latex_lines.append("  \\resumeItemListEnd")
+        latex_lines.append("  \\resumeSubHeadingListEnd")
+        latex_lines.append("")
+
+    # Projects section
+    if structured_resume.projects and structured_resume.projects.subsections:
+        latex_lines.append("\\section{Projects}")
+        latex_lines.append("  \\resumeSubHeadingListStart")
+        for item in structured_resume.projects.subsections:
+            heading = escape_latex_characters(item.get("heading", ""))
+            date = escape_latex_characters(item.get("date", ""))
+            
+            latex_lines.append(f"    \\resumeProjectHeading")
+            latex_lines.append(f"      {{\\textbf{{{heading}}}}}{{{date}}}")
+            
+            bullets = item.get("bullets", [])
+            non_empty_bullets = [b for b in bullets if b.strip()]
+            if non_empty_bullets:
+                latex_lines.append("     \\resumeItemListStart")
+                for bullet in non_empty_bullets:
+                    latex_lines.append(f"  \\resumeItem{{{escape_latex_characters(bullet)}}}")
+                latex_lines.append("\\resumeItemListEnd")
+        latex_lines.append("  \\resumeSubHeadingListEnd")
+        latex_lines.append("")
+
+    # Certifications section
+    if structured_resume.certifications and structured_resume.certifications.subsections:
+        latex_lines.append("\\section{Certifications \\& Achievements}")
+        latex_lines.append("  \\resumeSubHeadingListStart")
+        for item in structured_resume.certifications.subsections:
+            heading = escape_latex_characters(item.get("heading", ""))
+            date = escape_latex_characters(item.get("date", ""))
+            
+            latex_lines.append(f"    \\resumeProjectHeading")
+            latex_lines.append(f"      {{\\textbf{{{heading}}}}}{{{date}}}")
+            
+            bullets = item.get("bullets", [])
+            non_empty_bullets = [b for b in bullets if b.strip()]
+            if non_empty_bullets:
+                latex_lines.append("      \\resumeItemListStart")
+                for bullet in non_empty_bullets:
+                    latex_lines.append(f"        \\resumeItem{{{escape_latex_characters(bullet)}}}")
+                latex_lines.append("      \\resumeItemListEnd")
+        latex_lines.append("  \\resumeSubHeadingListEnd")
+        latex_lines.append("")
+
+    # Skills section
+    if structured_resume.skills and structured_resume.skills.lines:
+        latex_lines.append("\\section{Skills}")
+        latex_lines.append("  \\begin{itemize}[leftmargin=0.15in, label={}]")
+        latex_lines.append("    \\small{\\item{")
+        for i, line in enumerate(structured_resume.skills.lines):
+            escaped_line = escape_latex_characters(line)
+            if i < len(structured_resume.skills.lines) - 1:
+                latex_lines.append(f"      {escaped_line} " + r"\\")
+            else:
+                latex_lines.append(f"      {escaped_line}")
+        latex_lines.append("    }}")
+        latex_lines.append("  \\end{itemize}")
+        latex_lines.append("")
+        latex_lines.append("  }}")
+        latex_lines.append("\\end{itemize}")
+        latex_lines.append("")
+
+    latex_lines.append("\\end{document}")
+    return "\n".join(latex_lines)
+
+
+def structure_to_docx(structured_resume: StructuredResume) -> bytes:
+    """Convert structured resume to DOCX format"""
+    if not DOCX_AVAILABLE:
+        return None
+        
+    doc = Document()
+    
+    # Set margins
+    sections = doc.sections
+    for section in sections:
+        section.top_margin = Inches(0.5)
+        section.bottom_margin = Inches(0.5)
+        section.left_margin = Inches(0.75)
+        section.right_margin = Inches(0.75)
+    
+    # Contact section
+    if structured_resume.contact and structured_resume.contact.lines:
+        for line in structured_resume.contact.lines:
+            p = doc.add_paragraph(line)
+            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        doc.add_paragraph()
+    
+    # Summary section
+    if structured_resume.summary and structured_resume.summary.lines:
+        doc.add_heading('Professional Summary', level=1)
+        for line in structured_resume.summary.lines:
+            doc.add_paragraph(line)
+        doc.add_paragraph()
+    
+    # Helper for sections with subsections
+    def add_docx_section(title, section_obj):
+        if section_obj and section_obj.subsections:
+            doc.add_heading(title, level=1)
+            for item in section_obj.subsections:
+                heading = item.get("heading", "")
+                organization = item.get("organization", "")
+                location = item.get("location", "")
+                date = item.get("date", "")
+
+                # Create a paragraph for the heading line
+                p = doc.add_paragraph()
+                
+                # For Experience and Education: add heading first, then org/location
+                if title in ['Experience', 'Education']:
+                    p.add_run(heading).bold = True
+                    p.add_run("\t")
+                    p.add_run(date).italic = True
+                    
+                    if organization or location:
+                        org_line = doc.add_paragraph()
+                        org_info = organization
+                        if location:
+                            org_info += f" | {location}" if organization else location
+                        org_line.add_run(org_info).italic = True
+                else:
+                    # For Projects and Certifications: just heading and date
+                    p.add_run(heading).bold = True
+                    p.add_run("\t")
+                    p.add_run(date).italic = True
+                
+                # Set up right-aligned tab stop for dates
+                tab_stops = p.paragraph_format.tab_stops
+                tab_stops.add_tab_stop(Inches(6.0), alignment=WD_ALIGN_PARAGRAPH.RIGHT)
+
+                # Add bullet points
+                bullets = item.get("bullets", [])
+                for bullet in bullets:
+                    if bullet.strip():
+                        doc.add_paragraph(bullet, style='List Bullet')
+            doc.add_paragraph()
+
+    # Add all sections with subsections
+    add_docx_section('Education', structured_resume.education)
+    add_docx_section('Experience', structured_resume.experience)
+    add_docx_section('Projects', structured_resume.projects)
+    add_docx_section('Certifications & Achievements', structured_resume.certifications)
+
+    # Skills section
+    if structured_resume.skills and structured_resume.skills.lines:
+        doc.add_heading('Skills', level=1)
+        for line in structured_resume.skills.lines:
+            p = doc.add_paragraph()
+            p.add_run(line).bold = True
+        doc.add_paragraph()
+
+    # Save to bytes
+    docx_buffer = io.BytesIO()
+    doc.save(docx_buffer)
+    docx_buffer.seek(0)
+    return docx_buffer.getvalue()
+
+
 
 # API key configuration
 api_key = None
@@ -148,200 +558,9 @@ if enforce_structure:
         st.write(f"• Education: {structure.education.max_lines} lines, {structure.education.max_words_per_line} words/line")
         st.write(f"• Projects: {structure.projects.max_lines} lines, {structure.projects.max_words_per_line} words/line")
 
-def parse_latex_into_structure(latex_code: str) -> StructuredResume:
-    """Parse LaTeX resume into structured format"""
-    
-    prompt = f"""
-Parse this LaTeX resume into a structured JSON format. Extract the content from each section and organize it into lines.
 
-LaTeX Resume:
-{latex_code}
 
-Return a JSON object with this exact structure:
-{{
-    "contact": {{
-        "title": "Contact Information",
-        "lines": ["Name", "Email | Phone", "Location | LinkedIn"]
-    }},
-    "summary": {{
-        "title": "Summary",
-        "lines": ["Summary line 1", "Summary line 2"]
-    }},
-    "experience": {{
-        "title": "Experience",
-        "subsections": {{
-            "Job Title 1 | Company 1 | Date1": ["Bullet point 1", "Bullet point 2"],
-            "Job Title 2 | Company 2 | Date2": ["Bullet point 1", "Bullet point 2"]
-        }}
-    }},
-    "skills": {{
-        "title": "Skills",
-        "lines": ["Languages: Python, Java", "Frameworks: React, Django", "Tools: Git, Docker"]
-    }},
-    "education": {{
-        "title": "Education",
-        "lines": ["Degree | University | Year", "Relevant coursework or GPA if notable"]
-    }},
-    "projects": {{
-        "title": "Projects",
-        "subsections": {{
-            "Project 1 | Tech Stack": ["Description line 1", "Achievement line 2"],
-            "Project 2 | Tech Stack": ["Description line 1", "Achievement line 2"]
-        }}
-    }}
-}}
 
-Extract ONLY the text content, remove all LaTeX formatting. If a section doesn't exist, omit it from the JSON.
-Return only valid JSON, no additional text.
-"""
-    
-    try:
-        model = genai.GenerativeModel(selected_model)
-        response = model.generate_content(prompt)
-        
-        # Clean the response to get valid JSON
-        json_text = response.text.strip()
-        if json_text.startswith('```json'):
-            json_text = json_text[7:]
-        if json_text.endswith('```'):
-            json_text = json_text[:-3]
-        
-        data = json.loads(json_text.strip())
-        
-        # Convert to StructuredResume object
-        structured_resume = StructuredResume(
-            contact=ResumeSection(
-                title=data.get("contact", {}).get("title", "Contact Information"),
-                lines=data.get("contact", {}).get("lines", [])
-            )
-        )
-        
-        if "summary" in data:
-            structured_resume.summary = ResumeSection(
-                title=data["summary"]["title"],
-                lines=data["summary"]["lines"]
-            )
-            
-        if "experience" in data:
-            structured_resume.experience = ResumeSection(
-                title=data["experience"]["title"],
-                lines=[],
-                subsections=data["experience"].get("subsections", {})
-            )
-            
-        if "skills" in data:
-            structured_resume.skills = ResumeSection(
-                title=data["skills"]["title"],
-                lines=data["skills"]["lines"]
-            )
-            
-        if "education" in data:
-            structured_resume.education = ResumeSection(
-                title=data["education"]["title"],
-                lines=data["education"]["lines"]
-            )
-            
-        if "projects" in data:
-            structured_resume.projects = ResumeSection(
-                title=data["projects"]["title"],
-                lines=[],
-                subsections=data["projects"].get("subsections", {})
-            )
-            
-        return structured_resume
-        
-    except Exception as e:
-        st.error(f"Error parsing LaTeX structure: {str(e)}")
-        return None
-
-def optimize_content_lines(structured_resume: StructuredResume, job_description: str, structure_constraints: ResumeStructure) -> StructuredResume:
-    """Optimize each line of content based on job description and structure constraints"""
-    
-    prompt = f"""
-Optimize this structured resume content line by line to match the job description while respecting strict constraints.
-
-Job Description:
-{job_description}
-
-Current Resume Structure:
-{json.dumps(to_json_serializable(structured_resume), indent=2)}
-
-Structure Constraints:
-- Contact: Max {structure_constraints.contact.max_lines} lines, {structure_constraints.contact.max_words_per_line} words per line
-- Experience: Max {structure_constraints.experience.max_lines} lines total, {structure_constraints.experience.max_words_per_line} words per line
-- Skills: Max {structure_constraints.skills.max_lines} lines, {structure_constraints.skills.max_words_per_line} words per line
-- Education: Max {structure_constraints.education.max_lines} lines, {structure_constraints.education.max_words_per_line} words per line
-
-CRITICAL RULES:
-1. Maintain the EXACT same structure (same sections, same number of subsections)
-2. Edit ONLY the content of each line to be more job-relevant
-3. Respect word limits strictly - count words in each line
-4. Add relevant keywords from job description naturally
-5. Keep the most impactful and relevant content only
-6. Use strong action verbs and quantified achievements
-
-Return the optimized structure in the same JSON format, ensuring word limits are respected.
-Return only valid JSON, no additional text.
-"""
-    
-    try:
-        model = genai.GenerativeModel(selected_model)
-        response = model.generate_content(prompt)
-        
-        # Parse the optimized structure
-        json_text = response.text.strip()
-        if json_text.startswith('```json'):
-            json_text = json_text[7:]
-        if json_text.endswith('```'):
-            json_text = json_text[:-3]
-        
-        data = json.loads(json_text.strip())
-        
-        # Convert back to StructuredResume
-        optimized_resume = StructuredResume(
-            contact=ResumeSection(
-                title=data.get("contact", {}).get("title", "Contact Information"),
-                lines=data.get("contact", {}).get("lines", [])
-            )
-        )
-        
-        if "summary" in data:
-            optimized_resume.summary = ResumeSection(
-                title=data["summary"]["title"],
-                lines=data["summary"]["lines"]
-            )
-            
-        if "experience" in data:
-            optimized_resume.experience = ResumeSection(
-                title=data["experience"]["title"],
-                lines=[],
-                subsections=data["experience"].get("subsections", {})
-            )
-            
-        if "skills" in data:
-            optimized_resume.skills = ResumeSection(
-                title=data["skills"]["title"],
-                lines=data["skills"]["lines"]
-            )
-            
-        if "education" in data:
-            optimized_resume.education = ResumeSection(
-                title=data["education"]["title"],
-                lines=data["education"]["lines"]
-            )
-            
-        if "projects" in data:
-            optimized_resume.projects = ResumeSection(
-                title=data["projects"]["title"],
-                lines=[],
-                subsections=data["projects"].get("subsections", {})
-            )
-            
-        return optimized_resume
-        
-    except Exception as e:
-        st.error(f"Error optimizing content: {str(e)}")
-        return structured_resume
 
 def apply_ats_feedback(structured_resume: StructuredResume, ats_feedback: str, job_description: str) -> StructuredResume:
     """Apply ATS feedback to improve specific lines without changing structure"""
@@ -356,7 +575,7 @@ Job Description:
 {job_description}
 
 Current Resume Structure:
-{json.dumps(structured_resume.__dict__, default=lambda x: x.__dict__ if hasattr(x, '__dict__') else str(x), indent=2)}
+{json.dumps(to_json_serializable(structured_resume), indent=2)}
 
 CRITICAL RULES:
 1. ONLY edit the content of existing lines - do NOT add or remove lines
@@ -365,6 +584,7 @@ CRITICAL RULES:
 4. Improve quantified achievements where suggested
 5. Enhance action verbs and impact statements
 6. Maintain the same word count limits as the original lines
+7. Keep the same heading, organization, location, date structure for subsections
 
 Return the improved structure in the same JSON format with IDENTICAL structure but improved content.
 Return only valid JSON, no additional text.
@@ -383,14 +603,15 @@ Return only valid JSON, no additional text.
         
         data = json.loads(json_text.strip())
         
-        # Convert back to StructuredResume (same logic as before)
-        improved_resume = StructuredResume(
-            contact=ResumeSection(
-                title=data.get("contact", {}).get("title", "Contact Information"),
-                lines=data.get("contact", {}).get("lines", [])
-            )
-        )
+        # Convert back to StructuredResume
+        improved_resume = StructuredResume()
         
+        if "contact" in data:
+            improved_resume.contact = ResumeSection(
+                title=data["contact"]["title"],
+                lines=data["contact"]["lines"]
+            )
+            
         if "summary" in data:
             improved_resume.summary = ResumeSection(
                 title=data["summary"]["title"],
@@ -401,7 +622,7 @@ Return only valid JSON, no additional text.
             improved_resume.experience = ResumeSection(
                 title=data["experience"]["title"],
                 lines=[],
-                subsections=data["experience"].get("subsections", {})
+                subsections=data["experience"].get("subsections", [])
             )
             
         if "skills" in data:
@@ -413,14 +634,22 @@ Return only valid JSON, no additional text.
         if "education" in data:
             improved_resume.education = ResumeSection(
                 title=data["education"]["title"],
-                lines=data["education"]["lines"]
+                lines=[],
+                subsections=data["education"].get("subsections", [])
             )
             
         if "projects" in data:
             improved_resume.projects = ResumeSection(
                 title=data["projects"]["title"],
                 lines=[],
-                subsections=data["projects"].get("subsections", {})
+                subsections=data["projects"].get("subsections", [])
+            )
+            
+        if "certifications" in data:
+            improved_resume.certifications = ResumeSection(
+                title=data["certifications"]["title"],
+                lines=[],
+                subsections=data["certifications"].get("subsections", [])
             )
             
         return improved_resume
@@ -429,163 +658,391 @@ Return only valid JSON, no additional text.
         st.error(f"Error applying ATS feedback: {str(e)}")
         return structured_resume
 
-def structure_to_latex(structured_resume: StructuredResume, original_latex: str = None) -> str:
-    """Convert structured resume back to LaTeX format, preserving original template structure"""
+def optimize_content_lines(structured_resume: StructuredResume, job_description: str, structure_constraints: Optional[ResumeStructure] = None) -> StructuredResume:
+    """Optimize resume content for the specific job description while maintaining structure"""
     
-    # If we have the original LaTeX, try to preserve its structure
+    # Convert structured resume to JSON for AI processing
+    resume_json = to_json_serializable(structured_resume)
+    
+    # Build constraint information if provided
+    constraint_info = ""
+    if structure_constraints and enforce_structure:
+        constraint_info = f"""
+STRICT STRUCTURE CONSTRAINTS (MUST BE FOLLOWED):
+- Contact: Max {structure_constraints.contact.max_lines} lines, {structure_constraints.contact.max_words_per_line} words per line
+- Experience: Max {structure_constraints.experience.max_lines} lines total, {structure_constraints.experience.max_words_per_line} words per line
+- Skills: Max {structure_constraints.skills.max_lines} lines, {structure_constraints.skills.max_words_per_line} words per line
+- Education: Max {structure_constraints.education.max_lines} lines total, {structure_constraints.education.max_words_per_line} words per line
+- Projects: Max {structure_constraints.projects.max_lines} lines total, {structure_constraints.projects.max_words_per_line} words per line
+- Certifications: Max {structure_constraints.certifications.max_lines} lines total, {structure_constraints.certifications.max_words_per_line} words per line
+
+CRITICAL: Do NOT add or remove sections, subsections, or lines. Only modify the text content within existing lines and bullet points.
+"""
+    
+    prompt = f"""
+Tailor this resume for the specific job description. Focus on optimizing content to match job requirements while maintaining the exact same structure.
+
+Job Description:
+{job_description}
+
+Current Resume Structure:
+{json.dumps(resume_json, indent=2)}
+
+{constraint_info}
+
+INSTRUCTIONS:
+1. Analyze the job description for key requirements, skills, and keywords
+2. Optimize bullet points and descriptions to highlight relevant experience
+3. Use action verbs and quantified achievements where possible
+4. Include relevant keywords naturally in the content
+5. Maintain the same number of sections, subsections, and lines
+6. Keep the same headings, organizations, locations, and dates
+7. Only modify the text content of bullet points and description lines
+
+CRITICAL RULES:
+- Do NOT add or remove any sections, subsections, or lines
+- Do NOT change headings, organization names, locations, or dates
+- Do NOT change the structure - only improve the content
+- Ensure all bullet points are relevant to the target job
+- Use strong action verbs and quantified results
+- Include keywords from the job description naturally
+
+Return the improved resume in the same JSON format with identical structure but optimized content.
+Return only valid JSON, no additional text.
+"""
+    
+    try:
+        model = genai.GenerativeModel(selected_model)
+        response = model.generate_content(prompt)
+        
+        # Parse the response
+        json_text = response.text.strip()
+        if json_text.startswith('```json'):
+            json_text = json_text[7:]
+        if json_text.endswith('```'):
+            json_text = json_text[:-3]
+        
+        data = json.loads(json_text.strip())
+        
+        # Convert back to StructuredResume
+        optimized_resume = StructuredResume()
+        
+        if "contact" in data:
+            optimized_resume.contact = ResumeSection(
+                title=data["contact"]["title"],
+                lines=data["contact"]["lines"]
+            )
+            
+        if "summary" in data:
+            optimized_resume.summary = ResumeSection(
+                title=data["summary"]["title"],
+                lines=data["summary"]["lines"]
+            )
+            
+        if "experience" in data:
+            optimized_resume.experience = ResumeSection(
+                title=data["experience"]["title"],
+                lines=[],
+                subsections=data["experience"].get("subsections", [])
+            )
+            
+        if "skills" in data:
+            optimized_resume.skills = ResumeSection(
+                title=data["skills"]["title"],
+                lines=data["skills"]["lines"]
+            )
+            
+        if "education" in data:
+            optimized_resume.education = ResumeSection(
+                title=data["education"]["title"],
+                lines=[],
+                subsections=data["education"].get("subsections", [])
+            )
+            
+        if "projects" in data:
+            optimized_resume.projects = ResumeSection(
+                title=data["projects"]["title"],
+                lines=[],
+                subsections=data["projects"].get("subsections", [])
+            )
+            
+        if "certifications" in data:
+            optimized_resume.certifications = ResumeSection(
+                title=data["certifications"]["title"],
+                lines=[],
+                subsections=data["certifications"].get("subsections", [])
+            )
+            
+        return optimized_resume
+        
+    except Exception as e:
+        st.error(f"Error optimizing resume content: {str(e)}")
+        st.error(f"AI Response was: {response.text}")
+        return structured_resume
+
+def structure_to_latex(structured_resume: StructuredResume, original_latex: str = None) -> str:
+    """
+    Convert structured resume back to LaTeX format using proper resume template commands.
+    This version corrects the logic to ensure all sections with sub-items
+    (Experience, Projects, etc.) use the correct, separated formatting.
+    """
+    # If original_latex is provided, use a replacement strategy.
     if original_latex:
         return preserve_original_latex_structure(structured_resume, original_latex)
-    
-    # Fallback to basic template
+
+    # --- Fallback Generator using a Standard Template ---
+    # This part contains the corrected logic for generating from scratch.
     latex_lines = [
         "\\documentclass[letterpaper,11pt]{article}",
-        "\\usepackage[margin=0.75in]{geometry}",
-        "\\usepackage{enumitem}",
-        "\\usepackage[utf8]{inputenc}",
-        "\\usepackage[T1]{fontenc}",
-        "\\usepackage{xcolor}",
+        "\\usepackage{latexsym}",
+        "\\usepackage[empty]{fullpage}",
         "\\usepackage{titlesec}",
-        "\\usepackage{hyperref}",
+        "\\usepackage{marvosym}",
+        "\\usepackage[usenames,dvipsnames]{color}",
+        "\\usepackage{verbatim}",
+        "\\usepackage{enumitem}",
+        "\\usepackage[hidelinks]{hyperref}",
+        "\\usepackage{fancyhdr}",
+        "\\usepackage[english]{babel}",
+        "\\usepackage{tabularx}",
+        "\\input{glyphtounicode}",
         "",
-        "\\pagestyle{empty}",
-        "\\setlength{\\parindent}{0pt}",
-        "\\setlength{\\parskip}{0pt}",
+        "\\pagestyle{fancy}",
+        "\\fancyhf{}",
+        "\\fancyfoot{}",
+        "\\renewcommand{\\headrulewidth}{0pt}",
+        "\\renewcommand{\\footrulewidth}{0pt}",
         "",
-        "% Section formatting",
-        "\\titleformat{\\section}{\\large\\bfseries\\uppercase}{}{0em}{}[\\titlerule]",
-        "\\titlespacing{\\section}{0pt}{8pt}{4pt}",
+        "\\addtolength{\\oddsidemargin}{-0.5in}",
+        "\\addtolength{\\evensidemargin}{-0.5in}",
+        "\\addtolength{\\textwidth}{1in}",
+        "\\addtolength{\\topmargin}{-0.5in}",
+        "\\addtolength{\\textheight}{1.0in}",
+        "",
+        "\\urlstyle{same}",
+        "",
+        "\\raggedbottom",
+        "\\raggedright",
+        "\\setlength{\\tabcolsep}{0in}",
+        "",
+        "\\titleformat{\\section}{",
+        "  \\vspace{-3pt}\\scshape\\raggedright\\large",
+        "}{}{0em}{}[\\color{black}\\titlerule \\vspace{-4pt}]",
+        "",
+        "\\pdfgentounicode=1",
+        "",
+        "\\newcommand{\\resumeItem}[1]{",
+        "  \\item\\small{",
+        "    {#1 \\vspace{-1pt}}",
+        "  }",
+        "}",
+        "",
+        "\\newcommand{\\resumeSubheading}[4]{",
+        "  \\vspace{-1pt}\\item",
+        "    \\begin{tabular*}{0.97\\textwidth}[t]{l@{\\extracolsep{\\fill}}r}",
+        "      \\textbf{#1} & #2 \\\\",
+        "      \\textit{\\small#3} & \\textit{\\small #4} \\\\",
+        "    \\end{tabular*}\\vspace{-6pt}",
+        "}",
+        "",
+        "\\newcommand{\\resumeProjectHeading}[2]{",
+        "    \\item",
+        "    \\begin{tabular*}{0.97\\textwidth}{l@{\\extracolsep{\\fill}}r}",
+        "      \\small#1 & #2 \\\\",
+        "    \\end{tabular*}\\vspace{-6pt}",
+        "}",
+        "",
+        "\\newcommand{\\resumeSubHeadingListStart}{\\begin{itemize}[leftmargin=0.15in, label={}]}",
+        "\\newcommand{\\resumeSubHeadingListEnd}{\\end{itemize}}",
+        "\\newcommand{\\resumeItemListStart}{\\begin{itemize}}",
+        "\\newcommand{\\resumeItemListEnd}{\\end{itemize}\\vspace{-3pt}}",
         "",
         "\\begin{document}",
         ""
     ]
-    
-    # Contact section
+
+    # Contact section (remains the same)
     if structured_resume.contact and structured_resume.contact.lines:
-        latex_lines.append("% Contact Information")
+        latex_lines.append("\\begin{center}")
         for i, line in enumerate(structured_resume.contact.lines):
             escaped_line = escape_latex_characters(line)
             if i == 0:
-                latex_lines.append(f"\\begin{{center}}")
-                latex_lines.append(f"\\textbf{{\\large {escaped_line}}}")
-                latex_lines.append(f"\\end{{center}}")
+                latex_lines.append(f"    \\textbf{{\\Huge \\scshape {escaped_line}}} \\\\ \\vspace{{1pt}}")
             else:
-                latex_lines.append(f"\\centerline{{{escaped_line}}}")
+                latex_lines.append(f"    \\small {escaped_line}")
+        latex_lines.append("\\end{center}")
         latex_lines.append("")
-    
-    # Summary section
+
+    # Summary section (remains the same)
     if structured_resume.summary and structured_resume.summary.lines:
-        latex_lines.append("\\section{Summary}")
+        latex_lines.append("\\section{Professional Summary}")
         for line in structured_resume.summary.lines:
-            escaped_line = escape_latex_characters(line)
-            latex_lines.append(escaped_line)
+            latex_lines.append(f"\\small{{{escape_latex_characters(line)}}}")
         latex_lines.append("")
-    
+
+    # --- CORRECTED SECTIONS ---
+
+    # Education section
+    if structured_resume.education and structured_resume.education.subsections:
+        latex_lines.append("\\section{Education}")
+        latex_lines.append("  \\\\resumeSubHeadingListStart")
+        for item in structured_resume.education.subsections:
+            heading = escape_latex_characters(item.get("heading", ""))
+            organization = escape_latex_characters(item.get("organization", ""))
+            location = escape_latex_characters(item.get("location", ""))
+            date = escape_latex_characters(item.get("date", ""))
+            
+            # Corrected argument order: Heading, Date, Organization, Location
+            latex_lines.append(f"    \\\\resumeSubheading{{{heading}}}{{{date}}}{{{organization}}}{{{location}}}")
+            
+            # Bullet points (if any)
+            bullets = [b for b in item.get("bullets", []) if b.strip()]
+            if bullets:
+                latex_lines.append("    \\\\resumeItemListStart")
+                for bullet in bullets:
+                    latex_lines.append(f"      \\\\resumeItem{{{escape_latex_characters(bullet)}}}")
+                latex_lines.append("    \\\\resumeItemListEnd")
+        latex_lines.append("  \\\\resumeSubHeadingListEnd")
+        latex_lines.append("")
+
     # Experience section
     if structured_resume.experience and structured_resume.experience.subsections:
         latex_lines.append("\\section{Experience}")
-        for job_header, bullets in structured_resume.experience.subsections.items():
-            latex_lines.append(f"\\textbf{{{escape_latex_characters(job_header)}}}")
-            nonempty_bullets = [b for b in bullets if b.strip()]
-            if nonempty_bullets:
-                latex_lines.append("\\begin{itemize}[leftmargin=*,noitemsep,topsep=0pt]")
-                for bullet in nonempty_bullets:
-                    latex_lines.append(f"    \\item {escape_latex_characters(bullet)}")
-                latex_lines.append("\\end{itemize}")
+        latex_lines.append("  \\\\resumeSubHeadingListStart")
+        for item in structured_resume.experience.subsections:
+            heading = escape_latex_characters(item.get("heading", ""))
+            organization = escape_latex_characters(item.get("organization", ""))
+            location = escape_latex_characters(item.get("location", ""))
+            date = escape_latex_characters(item.get("date", ""))
+
+            # Uses the same \resumeSubheading command for consistency
+            latex_lines.append(f"    \\\\resumeSubheading{{{heading}}}{{{date}}}{{{organization}}}{{{location}}}")
+            
+            bullets = [b for b in item.get("bullets", []) if b.strip()]
+            if bullets:
+                latex_lines.append("    \\\\resumeItemListStart")
+                for bullet in bullets:
+                    latex_lines.append(f"      \\\\resumeItem{{{escape_latex_characters(bullet)}}}")
+                latex_lines.append("    \\\\resumeItemListEnd")
+        latex_lines.append("  \\\\resumeSubHeadingListEnd")
         latex_lines.append("")
-    
-    # Skills section
-    if structured_resume.skills and structured_resume.skills.lines:
-        latex_lines.append("\\section{Skills}")
-        for line in structured_resume.skills.lines:
-            escaped_line = escape_latex_characters(line)
-            latex_lines.append(f"\\textbf{{{escaped_line}}}")
-        latex_lines.append("")
-    
-    # Education section
-    if structured_resume.education and structured_resume.education.lines:
-        latex_lines.append("\\section{Education}")
-        for line in structured_resume.education.lines:
-            escaped_line = escape_latex_characters(line)
-            latex_lines.append(escaped_line)
-        latex_lines.append("")
-    
+
     # Projects section
     if structured_resume.projects and structured_resume.projects.subsections:
         latex_lines.append("\\section{Projects}")
-        for project_header, bullets in structured_resume.projects.subsections.items():
-            escaped_header = escape_latex_characters(project_header)
-            latex_lines.append(f"\\textbf{{{escaped_header}}}")
-            # --- FIX STARTS HERE ---
-            # Only create itemize environment if there are non-empty bullets
-            nonempty_bullets = [b for b in bullets if b.strip()]
-            if nonempty_bullets:
-                latex_lines.append("\\begin{itemize}[leftmargin=*,noitemsep,topsep=0pt]")
-                for bullet in nonempty_bullets:
-                    escaped_bullet = escape_latex_characters(bullet)
-                    latex_lines.append(f"    \\item {escaped_bullet}")
-                latex_lines.append("\\end{itemize}")
-            else:
-                 # Add a comment for debugging if there are no bullets
-                latex_lines.append("% No bullet points for this project")
-            # --- FIX ENDS HERE ---
+        latex_lines.append("  \\\\resumeSubHeadingListStart")
+        for item in structured_resume.projects.subsections:
+            heading = escape_latex_characters(item.get("heading", ""))
+            date = escape_latex_characters(item.get("date", ""))
+            
+            # Uses the \resumeProjectHeading command
+            latex_lines.append(f"    \\\\resumeProjectHeading{{\\\\textbf{{{heading}}}}}{{{date}}}")
+
+            bullets = [b for b in item.get("bullets", []) if b.strip()]
+            if bullets:
+                latex_lines.append("    \\\\resumeItemListStart")
+                for bullet in bullets:
+                    latex_lines.append(f"      \\\\resumeItem{{{escape_latex_characters(bullet)}}}")
+                latex_lines.append("    \\\\resumeItemListEnd")
+        latex_lines.append("  \\\\resumeSubHeadingListEnd")
         latex_lines.append("")
-    
+
+    # Certifications section
+    if structured_resume.certifications and structured_resume.certifications.subsections:
+        latex_lines.append("\\section{Certifications \\& Achievements}")
+        latex_lines.append("  \\\\resumeSubHeadingListStart")
+        for item in structured_resume.certifications.subsections:
+            heading = escape_latex_characters(item.get("heading", ""))
+            date = escape_latex_characters(item.get("date", ""))
+
+            # Uses the \resumeProjectHeading command
+            latex_lines.append(f"    \\\\resumeProjectHeading{{\\\\textbf{{{heading}}}}}{{{date}}}")
+
+            bullets = [b for b in item.get("bullets", []) if b.strip()]
+            if bullets:
+                latex_lines.append("    \\\\resumeItemListStart")
+                for bullet in bullets:
+                    latex_lines.append(f"      \\\\resumeItem{{{escape_latex_characters(bullet)}}}")
+                latex_lines.append("    \\\\resumeItemListEnd")
+        latex_lines.append("  \\\\resumeSubHeadingListEnd")
+        latex_lines.append("")
+
+    # Skills section (remains the same)
+    if structured_resume.skills and structured_resume.skills.lines:
+        latex_lines.append("\\section{Skills}")
+        latex_lines.append("  \\begin{itemize}[leftmargin=0.15in, label={}]")
+        latex_lines.append("    \\small{\\item{")
+        for i, line in enumerate(structured_resume.skills.lines):
+            escaped_line = escape_latex_characters(line)
+            if i < len(structured_resume.skills.lines) - 1:
+                latex_lines.append(f"      {escaped_line} " + r"\\")
+            else:
+                latex_lines.append(f"      {escaped_line}")
+        latex_lines.append("    }}")
+        latex_lines.append("  \\end{itemize}")
+        latex_lines.append("")
+
     latex_lines.append("\\end{document}")
-    
     return "\n".join(latex_lines)
+
 
 def preserve_original_latex_structure(structured_resume: StructuredResume, original_latex: str) -> str:
     """
     Preserve the original LaTeX template structure while updating content.
-    This version uses a more robust method for replacing section content.
+    This version ensures the correct commands and argument order are used.
     """
-    
-    # Start with the original document
+    import re
     updated_latex = original_latex
 
-    # --- HELPER FUNCTION TO SAFELY REPLACE A SECTION'S CONTENT ---
     def replace_section_content(full_latex, section_title, new_section_body):
-        import re
-        # Define the regex pattern for a section. It looks for:
-        # \section{The Title}
-        # ... and captures everything until the next \section or the end of the document.
-        section_pattern = re.compile(
-            r"(\\section\{" + re.escape(section_title) + r"\})(.+?)(?=\\section|\Z)",
+        # Regex to find a section and replace its content
+        pattern = re.compile(
+            r"(\\section\{" + re.escape(section_title) + r"\})(.+?)(?=\\section|\\end\{document\})",
             re.DOTALL | re.IGNORECASE
         )
-        # Use a lambda to avoid backslash escape issues in the replacement string
-        def repl(match):
-            return match.group(1) + "\n" + new_section_body
-        modified_latex, num_subs = section_pattern.subn(repl, full_latex)
-        if num_subs == 0:
-            return full_latex
-        return modified_latex
+        # If the section is found, replace its body with the new generated content
+        if pattern.search(full_latex):
+            return pattern.sub(r"\1" + "\n" + new_section_body, full_latex, 1)
+        # If not found, append the new section at the end before \end{document}
+        else:
+            new_section_text = f"\\section{{{section_title}}}\n{new_section_body}\n\n\\end{{document}}"
+            return full_latex.replace("\\end{document}", new_section_text)
 
-    # --- EXPERIENCE SECTION ---
+    # Experience Section
     if structured_resume.experience and structured_resume.experience.subsections:
-        content_lines = []
-        for job_header, bullets in structured_resume.experience.subsections.items():
-            content_lines.append(f"\\textbf{{{escape_latex_characters(job_header)}}}")
-            nonempty_bullets = [b for b in bullets if b.strip()]
-            if nonempty_bullets:
-                content_lines.append("\\begin{itemize}[leftmargin=*,noitemsep,topsep=0pt]")
-                for bullet in nonempty_bullets:
-                    content_lines.append(f"    \\item {escape_latex_characters(bullet)}")
-                content_lines.append("\\end{itemize}")
+        content_lines = ["  \\\\resumeSubHeadingListStart"]
+        for item in structured_resume.experience.subsections:
+            heading = escape_latex_characters(item.get("heading", ""))
+            organization = escape_latex_characters(item.get("organization", ""))
+            location = escape_latex_characters(item.get("location", ""))
+            date = escape_latex_characters(item.get("date", ""))
+            content_lines.append(f"    \\\\resumeSubheading{{{heading}}}{{{date}}}{{{organization}}}{{{location}}}")
+            bullets = [b for b in item.get("bullets", []) if b.strip()]
+            if bullets:
+                content_lines.append("    \\\\resumeItemListStart")
+                for bullet in bullets:
+                    content_lines.append(f"      \\\\resumeItem{{{escape_latex_characters(bullet)}}}")
+                content_lines.append("    \\\\resumeItemListEnd")
+        content_lines.append("  \\\\resumeSubHeadingListEnd")
         updated_latex = replace_section_content(updated_latex, "Experience", "\n".join(content_lines))
-
-    # --- PROJECTS SECTION (applying the same safe logic) ---
+    
+    # Projects Section
     if structured_resume.projects and structured_resume.projects.subsections:
-        content_lines = []
-        for proj_header, bullets in structured_resume.projects.subsections.items():
-            content_lines.append(f"\\textbf{{{escape_latex_characters(proj_header)}}}")
-            nonempty_bullets = [b for b in bullets if b.strip()]
-            if nonempty_bullets:
-                content_lines.append("\\begin{itemize}[leftmargin=*,noitemsep,topsep=0pt]")
-                for bullet in nonempty_bullets:
-                    content_lines.append(f"    \\item {escape_latex_characters(bullet)}")
-                content_lines.append("\\end{itemize}")
+        content_lines = ["  \\\\resumeSubHeadingListStart"]
+        for item in structured_resume.projects.subsections:
+            heading = escape_latex_characters(item.get("heading", ""))
+            date = escape_latex_characters(item.get("date", ""))
+            content_lines.append(f"    \\\\resumeProjectHeading{{\\\\textbf{{{heading}}}}}{{{date}}}")
+            bullets = [b for b in item.get("bullets", []) if b.strip()]
+            if bullets:
+                content_lines.append("    \\\\resumeItemListStart")
+                for bullet in bullets:
+                    content_lines.append(f"      \\\\resumeItem{{{escape_latex_characters(bullet)}}}")
+                content_lines.append("    \\\\resumeItemListEnd")
+        content_lines.append("  \\\\resumeSubHeadingListEnd")
         updated_latex = replace_section_content(updated_latex, "Projects", "\n".join(content_lines))
+
+    # Add other sections like Education, Certifications, etc., following the same pattern as above...
 
     return updated_latex
 
@@ -614,23 +1071,59 @@ def structure_to_docx(structured_resume: StructuredResume) -> bytes:
     
     # Summary section
     if structured_resume.summary and structured_resume.summary.lines:
-        doc.add_heading('Summary', level=1)
+        doc.add_heading('Professional Summary', level=1)
         for line in structured_resume.summary.lines:
             doc.add_paragraph(line)
         doc.add_paragraph()
     
-    # Experience section
-    if structured_resume.experience:
-        doc.add_heading('Experience', level=1)
-        if structured_resume.experience.subsections:
-            for job_header, bullets in structured_resume.experience.subsections.items():
+    # Helper for sections with subsections
+    def add_docx_section(title, section_obj):
+        if section_obj and section_obj.subsections:
+            doc.add_heading(title, level=1)
+            for item in section_obj.subsections:
+                heading = item.get("heading", "")
+                organization = item.get("organization", "")
+                location = item.get("location", "")
+                date = item.get("date", "")
+
+                # Create a paragraph for the heading line
                 p = doc.add_paragraph()
-                p.add_run(job_header).bold = True
+                
+                # For Experience and Education: add heading first, then org/location
+                if title in ['Experience', 'Education']:
+                    p.add_run(heading).bold = True
+                    p.add_run("\t")
+                    p.add_run(date).italic = True
+                    
+                    if organization or location:
+                        org_line = doc.add_paragraph()
+                        org_info = organization
+                        if location:
+                            org_info += f" | {location}" if organization else location
+                        org_line.add_run(org_info).italic = True
+                else:
+                    # For Projects and Certifications: just heading and date
+                    p.add_run(heading).bold = True
+                    p.add_run("\t")
+                    p.add_run(date).italic = True
+                
+                # Set up right-aligned tab stop for dates
+                tab_stops = p.paragraph_format.tab_stops
+                tab_stops.add_tab_stop(Inches(6.0), alignment=WD_ALIGN_PARAGRAPH.RIGHT)
+
+                # Add bullet points
+                bullets = item.get("bullets", [])
                 for bullet in bullets:
-                    if bullet.strip(): # Only add non-empty bullets
+                    if bullet.strip():
                         doc.add_paragraph(bullet, style='List Bullet')
-        doc.add_paragraph()
-    
+            doc.add_paragraph()
+
+    # Add all sections with subsections
+    add_docx_section('Education', structured_resume.education)
+    add_docx_section('Experience', structured_resume.experience)
+    add_docx_section('Projects', structured_resume.projects)
+    add_docx_section('Certifications & Achievements', structured_resume.certifications)
+
     # Skills section
     if structured_resume.skills and structured_resume.skills.lines:
         doc.add_heading('Skills', level=1)
@@ -638,24 +1131,7 @@ def structure_to_docx(structured_resume: StructuredResume) -> bytes:
             p = doc.add_paragraph()
             p.add_run(line).bold = True
         doc.add_paragraph()
-    
-    # Education section
-    if structured_resume.education and structured_resume.education.lines:
-        doc.add_heading('Education', level=1)
-        for line in structured_resume.education.lines:
-            doc.add_paragraph(line)
-        doc.add_paragraph()
-    
-    # Projects section
-    if structured_resume.projects and structured_resume.projects.subsections:
-        doc.add_heading('Projects', level=1)
-        for project_header, bullets in structured_resume.projects.subsections.items():
-            p = doc.add_paragraph()
-            p.add_run(project_header).bold = True
-            for bullet in bullets:
-                 if bullet.strip(): # Only add non-empty bullets
-                    doc.add_paragraph(bullet, style='List Bullet')
-    
+
     # Save to bytes
     docx_buffer = io.BytesIO()
     doc.save(docx_buffer)
@@ -956,7 +1432,7 @@ if 'generated_latex' in st.session_state:
                 st.session_state['improved_latex'] = clean_latex_output(improved_latex)
                 st.session_state['improved_structured_resume'] = improved_resume
                 st.success("✅ ATS-Improved version generated! Select it above to download.")
-                st.experimental_rerun()
+                st.rerun()
 
     # Download buttons
     pdf_col, docx_col = st.columns(2)
